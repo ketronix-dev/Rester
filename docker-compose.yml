@@ -1,0 +1,35 @@
+services:
+  rester:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - /home/artem/Downloads/repos:/app/repos
+      - ./restore:/app/restore
+    environment:
+      - RESTIC_PASSWORD=RrA72sHNf9WcQ2
+      - DB_HOST=mariadb
+      - DB_USER=rester
+      - DB_PASSWORD=rester_secret
+      - DB_NAME=rester_db
+    restart: unless-stopped
+    container_name: rester_app
+    depends_on:
+      - mariadb
+
+  mariadb:
+    image: mariadb:latest
+    restart: unless-stopped
+    container_name: rester_db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_secret
+      MYSQL_DATABASE: rester_db
+      MYSQL_USER: rester
+      MYSQL_PASSWORD: rester_secret
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+
+volumes:
+  mariadb_data:
