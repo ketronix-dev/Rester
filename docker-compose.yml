@@ -4,7 +4,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /home/artem/Downloads/repos:/app/repos
+      - :/app/repos
       - ./restore:/app/restore
     environment:
       - RESTIC_PASSWORD=

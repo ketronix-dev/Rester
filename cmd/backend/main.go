@@ -42,6 +42,7 @@ func main() {
 		RawHeaders: []string{
 			`<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">`,
 			`<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0" />`,
+			`<base href="/restic/" />`,
 			// Google Font for Logo (Optional)
 			`<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">`,
 		},
