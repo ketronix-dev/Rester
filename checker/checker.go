@@ -160,10 +160,17 @@ type CachedRepoStats struct {
 	Timestamp time.Time
 }
 
+type IndividualSnapshotStats struct {
+	Size      int64
+	FileCount int
+}
+
 var (
-	repoCache  = make(map[string]CachedRepoStats)
-	cacheMutex sync.Mutex
-	cacheTTL   = 5 * time.Minute
+	repoCache      = make(map[string]CachedRepoStats)
+	cacheMutex     sync.Mutex
+	cacheTTL       = 5 * time.Minute
+	snapStatsCache = make(map[string]IndividualSnapshotStats)
+	snapStatsMutex sync.Mutex
 )
 
 func GetRepoStats(name string) (RepoStats, error) {
@@ -214,13 +221,51 @@ func GetRepoStats(name string) (RepoStats, error) {
 			durStr = dur.Round(time.Second).String()
 		}
 
+		size := rs.Summary.TotalBytesProcessed
+		fileCount := rs.Summary.TotalFilesProcessed
+
+		// If summary is missing (size 0), check cache or fetch
+		if size == 0 {
+			snapStatsMutex.Lock()
+			cached, ok := snapStatsCache[rs.ID]
+			snapStatsMutex.Unlock()
+
+			if ok {
+				size = cached.Size
+				fileCount = cached.FileCount
+			} else {
+				// We need to fetch it.
+				// NOTE: Doing this sequentially here might be slow if many snapshots are missing stats.
+				// However, once cached, it's fast. We'll do it sequentially for safety.
+				log.Printf("GetRepoStats: Fetching missing stats for snapshot %s", rs.ShortID)
+				cmdIndStats := exec.Command("restic", "-r", repoPath, "stats", rs.ID, "--json", "--mode", "restore-size", "--no-lock")
+				cmdIndStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+				out, err := cmdIndStats.Output()
+				if err == nil {
+					var indStats ResticStats
+					if err := json.Unmarshal(out, &indStats); err == nil {
+						size = indStats.TotalSize
+						fileCount = indStats.TotalFileCount
+
+						// Update cache
+						snapStatsMutex.Lock()
+						snapStatsCache[rs.ID] = IndividualSnapshotStats{
+							Size:      size,
+							FileCount: fileCount,
+						}
+						snapStatsMutex.Unlock()
+					}
+				}
+			}
+		}
+
 		s := Snapshot{
 			ID:        rs.ID,
 			ShortID:   rs.ShortID,
 			Time:      rs.Time,
 			TimeStr:   rs.Time.Format("02.01.2006 15:04"),
-			Size:      rs.Summary.TotalBytesProcessed,
-			FileCount: rs.Summary.TotalFilesProcessed,
+			Size:      size,
+			FileCount: fileCount,
 			Tree:      rs.Tree,
 			Paths:     rs.Paths,
 			Hostname:  rs.Hostname,
