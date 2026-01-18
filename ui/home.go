@@ -1167,8 +1167,24 @@ func (h *Home) Render() app.UI {
 
 				app.Div().Class("repo-panel").Body(
 					app.Div().Class("repo-toolbar").Body(
-						app.Div().Style("display", "flex").Style("align-items", "center").Style("gap", "12px").Body(
+						app.Div().Style("display", "flex").Style("align-items", "center").Style("gap", "12px").Style("width", "100%").Body(
 							app.Div().Style("font-weight", "500").Style("font-size", "16px").Text("Snapshot History"),
+
+							// Spacer
+							app.Div().Style("flex-grow", "1"),
+
+							// Progress Bar (Inline)
+							app.If(h.StatsProgress.Running,
+								app.Div().Class("stats-progress-inline").Style("display", "flex").Style("align-items", "center").Style("gap", "8px").Style("margin-right", "12px").Body(
+									app.Span().Style("font-size", "12px").Style("color", "var(--md-sys-color-on-surface-variant)").Text(fmt.Sprintf("%d/%d", h.StatsProgress.Processed, h.StatsProgress.Total)),
+									app.Progress().
+										Max(h.StatsProgress.Total).
+										Value(h.StatsProgress.Processed).
+										Style("width", "80px").
+										Style("height", "4px"),
+								),
+							),
+
 							app.Button().
 								Class("btn-icon").
 								Title("Check Integrity").
@@ -1185,20 +1201,6 @@ func (h *Home) Render() app.UI {
 								Body(
 									app.Span().Class("material-symbols-rounded").Style("font-size", "20px").Text("refresh"),
 								),
-						),
-					),
-					// Progress Bar
-					app.If(h.StatsProgress.Running,
-						app.Div().Class("stats-progress").Style("margin", "0 16px 16px 16px").Body(
-							app.Div().Style("display", "flex").Style("justify-content", "space-between").Style("margin-bottom", "4px").Body(
-								app.Span().Style("font-size", "12px").Text(fmt.Sprintf("Processing stats: %d/%d snapshots...", h.StatsProgress.Processed, h.StatsProgress.Total)),
-								app.Span().Style("font-size", "12px").Text(fmt.Sprintf("%s", h.StatsProgress.CurrentID)),
-							),
-							app.Progress().
-								Max(h.StatsProgress.Total).
-								Value(h.StatsProgress.Processed).
-								Style("width", "100%").
-								Style("height", "4px"),
 						),
 					),
 					app.Div().Class("snapshot-list").Body(

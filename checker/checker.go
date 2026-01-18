@@ -209,6 +209,25 @@ func GetRepoStats(name string) (RepoStats, error) {
 		if time.Since(cached.Timestamp) < cacheTTL {
 			cacheMutex.Unlock()
 			log.Printf("GetRepoStats: Returning cached stats for '%s'", name)
+
+			// Enrich cached stats with latest DB data
+			// This ensures that as background worker updates DB, we see it on next poll
+			if DB != nil {
+				enrichedSnaps := make([]Snapshot, len(cached.Stats.Snapshots))
+				copy(enrichedSnaps, cached.Stats.Snapshots)
+
+				for i, s := range enrichedSnaps {
+					var dbSize int64
+					var dbCount int
+					var dbProcessed bool
+					if err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbProcessed); err == nil && dbProcessed {
+						enrichedSnaps[i].Size = dbSize
+						enrichedSnaps[i].FileCount = dbCount
+					}
+				}
+				cached.Stats.Snapshots = enrichedSnaps
+			}
+
 			return cached.Stats, nil
 		}
 	}
