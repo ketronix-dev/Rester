@@ -7,7 +7,7 @@ services:
       - /home/artem/Downloads/repos:/app/repos
       - ./restore:/app/restore
     environment:
-      - RESTIC_PASSWORD=RrA72sHNf9WcQ2
+      - RESTIC_PASSWORD=password
       - DB_HOST=mariadb
       - DB_USER=rester
       - DB_PASSWORD=rester_secret

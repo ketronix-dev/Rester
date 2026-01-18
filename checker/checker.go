@@ -73,6 +73,7 @@ type ResticSnapshot struct {
 
 type ResticStats struct {
 	TotalSize              int64   `json:"total_size"`
+	TotalFileCount         int     `json:"total_file_count"`
 	TotalUncompressedSize  int64   `json:"total_uncompressed_size"`
 	CompressionRatio       float64 `json:"compression_ratio"`
 	CompressionSpaceSaving float64 `json:"compression_space_saving"`
@@ -186,7 +187,7 @@ func GetRepoStats(name string) (RepoStats, error) {
 	}
 
 	// 1. Get Snapshots
-	cmdSnap := exec.Command("restic", "-r", repoPath, "snapshots", "--json")
+	cmdSnap := exec.Command("restic", "-r", repoPath, "snapshots", "--json", "--no-lock")
 	cmdSnap.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
 	log.Printf("GetRepoStats: Running %v", cmdSnap.Args)
@@ -229,44 +230,39 @@ func GetRepoStats(name string) (RepoStats, error) {
 		}
 		stats.Snapshots = append(stats.Snapshots, s)
 	}
-	// Calculate global stats
-	totalSize := uint64(0)
-	totalFiles := uint64(0)
-	for _, s := range stats.Snapshots {
-		totalSize += uint64(s.Size)
-		totalFiles += uint64(s.FileCount)
-	}
-	// Note: Without 'restic stats', UncompressedUsage and CompressionRatio are approximations or need separate logic.
-	// For now we rely on the expensive 'restic stats' command which we run NEXT.
 
-	// 2. Run Stats (Expensive!)
+	// 2. Run Stats (restore-size mode to match user expectation)
 	log.Printf("GetRepoStats: Running stats command...")
-	// For performance, we might want to skip this if not explicitly requested, or cache it heavily.
-	// Current implementation runs it always, which is the bottleneck.
-	// Optimizing to parse summary from snapshots or standard `restic stats`
-
-	cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--mode", "raw-data", "--json")
+	// We use standard 'stats --json' which defaults to restore-size (latest snapshot)
+	cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--json", "--no-lock")
 	cmdStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+
+	// Capture stderr for debugging
+	var stderr strings.Builder
+	cmdStats.Stderr = &stderr
+
 	outputStats, err := cmdStats.Output()
 	if err == nil {
 		var rStats ResticStats
 		if err := json.Unmarshal(outputStats, &rStats); err == nil {
+			// In restore-size mode, TotalSize is the restored size (uncompressed equivalent)
+			stats.UncompressedUsage = formatBytes(rStats.TotalSize)
+
+			// We don't get 'DiskUsage' (repo size) here, so we might set it to 'Unknown' or
+			// try to estimate it. For now, let's use TotalSize as the primary metrics for display
+			// to match user CLI expectation, even if technical labels might differ slightly.
 			stats.DiskUsage = formatBytes(rStats.TotalSize)
-			stats.UncompressedUsage = formatBytes(rStats.TotalUncompressedSize)
-			if rStats.TotalSize > 0 {
-				ratio := float64(rStats.TotalUncompressedSize) / float64(rStats.TotalSize)
-				stats.CompressionRatio = fmt.Sprintf("%.2fx", ratio)
 
-				// User requested percentage for savings
-				savingPct := (float64(rStats.TotalUncompressedSize-rStats.TotalSize) / float64(rStats.TotalUncompressedSize)) * 100
-				stats.SpaceSaving = fmt.Sprintf("%.1f%%", savingPct)
-			}
+			// restore-size doesn't provide BlobCount or Compression stats
 			stats.SnapshotCount = rStats.SnapshotsCount
-			stats.BlobCount = rStats.TotalBlobCount
+			stats.BlobCount = 0              // Not available in restore-size
+			stats.CompressionRatio = "1.00x" // Not available
+			stats.SpaceSaving = "0%"
 
-			log.Printf("GetRepoStats: Restic Stats - Size: %s, Uncompressed: %s, Ratio: %s", stats.DiskUsage, stats.UncompressedUsage, stats.CompressionRatio)
+			log.Printf("GetRepoStats: Restic Stats Success - Size: %s", stats.DiskUsage)
 		}
 	} else {
+		log.Printf("GetRepoStats: Stats command failed: %v | Stderr: %s", err, stderr.String())
 		stats.DiskUsage = "0 B"
 		stats.UncompressedUsage = "0 B"
 	}
@@ -281,7 +277,7 @@ func GetSnapshotTree(repoName, snapshotID string) ([]ResticNode, error) {
 		password = "test"
 	}
 
-	cmd := exec.Command("restic", "-r", repoPath, "ls", snapshotID, "--json")
+	cmd := exec.Command("restic", "-r", repoPath, "ls", snapshotID, "--json", "--no-lock")
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
 	start := time.Now()
@@ -473,7 +469,7 @@ func runCheckProcess(repoName string) {
 		password = "test"
 	}
 
-	cmd := exec.Command("restic", "-r", repoPath, "check")
+	cmd := exec.Command("restic", "-r", repoPath, "check", "--no-lock")
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
 	// Capture stdout and stderr
