@@ -1207,10 +1207,10 @@ func (h *Home) Render() app.UI {
 						app.Div().Class("table-header").Body(
 							app.Div().Class("header").Text("ID"),
 							app.Div().Class("header").Text("Time"),
-							app.Div().Class("header").Text("Tags"),
+							app.Div().Class("header").Text("Hostname"),
+							app.Div().Class("header").Text("Duration"),
 							app.Div().Class("header").Text("Size"),
 							app.Div().Class("header").Text("Files"),
-							app.Div().Class("header").Text("Duration"),
 							app.Div().Class("header").Style("text-align", "right").Text("Actions"),
 						),
 						app.Div().Class("table-body").Body(
@@ -1223,14 +1223,10 @@ func (h *Home) Render() app.UI {
 								return app.Div().Class("table-row").Body(
 									app.Div().Class("cell").Attr("data-label", "ID").Style("font-family", "monospace").Style("color", "var(--md-sys-color-primary)").Text(shortID),
 									app.Div().Class("cell").Attr("data-label", "Time").Text(snap.TimeStr),
-									app.Div().Class("cell").Attr("data-label", "Tags").Body(
-										app.Range(snap.Tags).Slice(func(j int) app.UI {
-											return app.Span().Class("badge").Text(snap.Tags[j])
-										}),
-									),
+									app.Div().Class("cell").Attr("data-label", "Hostname").Text(snap.Hostname),
+									app.Div().Class("cell").Attr("data-label", "Duration").Text(snap.Duration),
 									app.Div().Class("cell").Attr("data-label", "Size").Text(formatSize(snap.Size)),
 									app.Div().Class("cell").Attr("data-label", "Files").Text(fmt.Sprintf("%d", snap.FileCount)),
-									app.Div().Class("cell").Attr("data-label", "Duration").Text(snap.Duration),
 									app.Div().Class("cell").Style("position", "relative").Style("display", "flex").Style("justify-content", "flex-end").Body(
 										app.Button().Class("btn-icon").
 											Title("Actions").
