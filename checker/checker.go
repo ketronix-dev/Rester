@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,12 +9,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"rester/logger"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/host"
 )
+
+var (
+	DB *sql.DB
+)
+
+func SetDB(db *sql.DB) {
+	DB = db
+}
 
 type SystemStatus struct {
 	SSHInstalled    bool     `json:"ssh_installed"`
@@ -73,7 +83,6 @@ type ResticSnapshot struct {
 
 type ResticStats struct {
 	TotalSize              int64   `json:"total_size"`
-	TotalFileCount         int     `json:"total_file_count"`
 	TotalUncompressedSize  int64   `json:"total_uncompressed_size"`
 	CompressionRatio       float64 `json:"compression_ratio"`
 	CompressionSpaceSaving float64 `json:"compression_space_saving"`
@@ -160,18 +169,39 @@ type CachedRepoStats struct {
 	Timestamp time.Time
 }
 
-type IndividualSnapshotStats struct {
-	Size      int64
-	FileCount int
+// Stats Worker Structures
+type SnapshotCache struct {
+	SnapshotID string    `json:"snapshot_id"`
+	RepoName   string    `json:"repo_name"`
+	Size       int64     `json:"size"`
+	FileCount  int       `json:"file_count"`
+	Duration   string    `json:"duration"`
+	Processed  bool      `json:"processed"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type StatsProgress struct {
+	Total      int    `json:"total"`
+	Processed  int    `json:"processed"`
+	ErrorCount int    `json:"error_count"`
+	Running    bool   `json:"running"`
+	CurrentID  string `json:"current_id"`
 }
 
 var (
-	repoCache      = make(map[string]CachedRepoStats)
-	cacheMutex     sync.Mutex
-	cacheTTL       = 5 * time.Minute
-	snapStatsCache = make(map[string]IndividualSnapshotStats)
-	snapStatsMutex sync.Mutex
+	repoCache  = make(map[string]CachedRepoStats)
+	cacheMutex sync.Mutex
+	cacheTTL   = 5 * time.Minute
+
+	statsProgress = StatsProgress{}
+	styleMutex    sync.Mutex // Reusing for progress too
 )
+
+func GetStatsProgress() StatsProgress {
+	styleMutex.Lock()
+	defer styleMutex.Unlock()
+	return statsProgress
+}
 
 func GetRepoStats(name string) (RepoStats, error) {
 	cacheMutex.Lock()
@@ -184,7 +214,7 @@ func GetRepoStats(name string) (RepoStats, error) {
 	}
 	cacheMutex.Unlock()
 
-	log.Printf("GetRepoStats: Starting Restic CLI scan for repo '%s'", name)
+	logger.Info("GetRepoStats: Starting Restic CLI scan for repo '%s'", name)
 	stats := RepoStats{Name: name}
 	repoPath := filepath.Join(".", "repos", name)
 
@@ -194,16 +224,16 @@ func GetRepoStats(name string) (RepoStats, error) {
 	}
 
 	// 1. Get Snapshots
-	cmdSnap := exec.Command("restic", "-r", repoPath, "snapshots", "--json", "--no-lock")
+	cmdSnap := exec.Command("restic", "-r", repoPath, "snapshots", "--json")
 	cmdSnap.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
-	log.Printf("GetRepoStats: Running %v", cmdSnap.Args)
+	logger.Debug("GetRepoStats: Running %v", cmdSnap.Args)
 	outputSnap, err := cmdSnap.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			log.Printf("GetRepoStats: Restic stderr: %s", string(exitErr.Stderr))
+			logger.Error("GetRepoStats: Restic stderr: %s", string(exitErr.Stderr))
 		}
-		log.Printf("GetRepoStats: Error running snapshots command: %v", err)
+		logger.Error("GetRepoStats: Error running snapshots command: %v", err)
 		return stats, fmt.Errorf("failed to list snapshots: %w", err)
 	}
 
@@ -221,51 +251,13 @@ func GetRepoStats(name string) (RepoStats, error) {
 			durStr = dur.Round(time.Second).String()
 		}
 
-		size := rs.Summary.TotalBytesProcessed
-		fileCount := rs.Summary.TotalFilesProcessed
-
-		// If summary is missing (size 0), check cache or fetch
-		if size == 0 {
-			snapStatsMutex.Lock()
-			cached, ok := snapStatsCache[rs.ID]
-			snapStatsMutex.Unlock()
-
-			if ok {
-				size = cached.Size
-				fileCount = cached.FileCount
-			} else {
-				// We need to fetch it.
-				// NOTE: Doing this sequentially here might be slow if many snapshots are missing stats.
-				// However, once cached, it's fast. We'll do it sequentially for safety.
-				log.Printf("GetRepoStats: Fetching missing stats for snapshot %s", rs.ShortID)
-				cmdIndStats := exec.Command("restic", "-r", repoPath, "stats", rs.ID, "--json", "--mode", "restore-size", "--no-lock")
-				cmdIndStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
-				out, err := cmdIndStats.Output()
-				if err == nil {
-					var indStats ResticStats
-					if err := json.Unmarshal(out, &indStats); err == nil {
-						size = indStats.TotalSize
-						fileCount = indStats.TotalFileCount
-
-						// Update cache
-						snapStatsMutex.Lock()
-						snapStatsCache[rs.ID] = IndividualSnapshotStats{
-							Size:      size,
-							FileCount: fileCount,
-						}
-						snapStatsMutex.Unlock()
-					}
-				}
-			}
-		}
-
 		s := Snapshot{
 			ID:        rs.ID,
 			ShortID:   rs.ShortID,
 			Time:      rs.Time,
 			TimeStr:   rs.Time.Format("02.01.2006 15:04"),
-			Size:      size,
-			FileCount: fileCount,
+			Size:      rs.Summary.TotalBytesProcessed,
+			FileCount: rs.Summary.TotalFilesProcessed,
 			Tree:      rs.Tree,
 			Paths:     rs.Paths,
 			Hostname:  rs.Hostname,
@@ -273,69 +265,111 @@ func GetRepoStats(name string) (RepoStats, error) {
 			Tags:      rs.Tags,
 			Duration:  durStr,
 		}
+
+		// Enrich from DB
+		if DB != nil {
+			var dbSize int64
+			var dbCount int
+			var dbProcessed bool
+			if err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbProcessed); err == nil && dbProcessed {
+				s.Size = dbSize
+				s.FileCount = dbCount
+				// Duration is tricky as we just have string from 'cat snapshot' or stored val.
+				// Plan had 'duration' col. If we implement duration in worker, we can read it too.
+				// For now mainly Size/Count.
+			}
+		}
+
 		stats.Snapshots = append(stats.Snapshots, s)
 	}
+	// Calculate global stats
+	totalSize := uint64(0)
+	totalFiles := uint64(0)
+	for _, s := range stats.Snapshots {
+		totalSize += uint64(s.Size)
+		totalFiles += uint64(s.FileCount)
+	}
+	// Note: Without 'restic stats', UncompressedUsage and CompressionRatio are approximations or need separate logic.
+	// For now we rely on the expensive 'restic stats' command which we run NEXT.
 
-	// 2. Run Stats (restore-size mode to match user expectation)
-	log.Printf("GetRepoStats: Running stats command...")
-	// We use standard 'stats --json' which defaults to restore-size (latest snapshot)
-	cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--json", "--no-lock")
+	// 2. Run Stats (Expensive!)
+	logger.Info("GetRepoStats: Running stats command...")
+	// For performance, we might want to skip this if not explicitly requested, or cache it heavily.
+	// Current implementation runs it always, which is the bottleneck.
+	// Optimizing to parse summary from snapshots or standard `restic stats`
+
+	cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--mode", "raw-data", "--json")
 	cmdStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
-
-	// Capture stderr for debugging
-	var stderr strings.Builder
-	cmdStats.Stderr = &stderr
-
 	outputStats, err := cmdStats.Output()
 	if err == nil {
 		var rStats ResticStats
 		if err := json.Unmarshal(outputStats, &rStats); err == nil {
-			// In restore-size mode, TotalSize is the restored size (uncompressed equivalent)
-			stats.UncompressedUsage = formatBytes(rStats.TotalSize)
-
-			// We don't get 'DiskUsage' (repo size) here, so we might set it to 'Unknown' or
-			// try to estimate it. For now, let's use TotalSize as the primary metrics for display
-			// to match user CLI expectation, even if technical labels might differ slightly.
 			stats.DiskUsage = formatBytes(rStats.TotalSize)
+			stats.UncompressedUsage = formatBytes(rStats.TotalUncompressedSize)
+			if rStats.TotalSize > 0 {
+				ratio := float64(rStats.TotalUncompressedSize) / float64(rStats.TotalSize)
+				stats.CompressionRatio = fmt.Sprintf("%.2fx", ratio)
 
-			// restore-size doesn't provide BlobCount or Compression stats
+				// User requested percentage for savings
+				savingPct := (float64(rStats.TotalUncompressedSize-rStats.TotalSize) / float64(rStats.TotalUncompressedSize)) * 100
+				stats.SpaceSaving = fmt.Sprintf("%.1f%%", savingPct)
+			}
 			stats.SnapshotCount = rStats.SnapshotsCount
-			stats.BlobCount = 0              // Not available in restore-size
-			stats.CompressionRatio = "1.00x" // Not available
-			stats.SpaceSaving = "0%"
+			stats.BlobCount = rStats.TotalBlobCount
 
-			log.Printf("GetRepoStats: Restic Stats Success - Size: %s", stats.DiskUsage)
+			logger.Info("GetRepoStats: Restic Stats - Size: %s, Uncompressed: %s, Ratio: %s", stats.DiskUsage, stats.UncompressedUsage, stats.CompressionRatio)
 		}
 	} else {
-		log.Printf("GetRepoStats: Stats command failed: %v | Stderr: %s", err, stderr.String())
 		stats.DiskUsage = "0 B"
 		stats.UncompressedUsage = "0 B"
 	}
 
+	cacheMutex.Lock()
+	repoCache[name] = CachedRepoStats{Stats: stats, Timestamp: time.Now()}
+	cacheMutex.Unlock()
+
+	// Trigger background stats enrichment
+	ProcessSnapshotStats(name, stats.Snapshots)
+
 	return stats, nil
 }
 
+// Tree Cache
+var (
+	treeCache      = make(map[string][]ResticNode)
+	treeCacheMutex sync.Mutex
+)
+
 func GetSnapshotTree(repoName, snapshotID string) ([]ResticNode, error) {
+	cacheKey := repoName + "-" + snapshotID
+	treeCacheMutex.Lock()
+	if nodes, ok := treeCache[cacheKey]; ok {
+		treeCacheMutex.Unlock()
+		// logger.Debug("GetSnapshotTree: Cache hit for %s", snapshotID)
+		return nodes, nil
+	}
+	treeCacheMutex.Unlock()
+
 	repoPath := filepath.Join(".", "repos", repoName)
 	password := os.Getenv("RESTIC_PASSWORD")
 	if password == "" {
 		password = "test"
 	}
 
-	cmd := exec.Command("restic", "-r", repoPath, "ls", snapshotID, "--json", "--no-lock")
+	cmd := exec.Command("restic", "-r", repoPath, "ls", snapshotID, "--json")
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
 	start := time.Now()
-	log.Printf("GetSnapshotTree: Starting ls for snapshot %s", snapshotID)
+	logger.Info("GetSnapshotTree: Starting ls for snapshot %s", snapshotID)
 
 	output, err := cmd.Output()
 	duration := time.Since(start)
 
 	if err != nil {
-		log.Printf("GetSnapshotTree: Failed after %v: %v", duration, err)
+		logger.Error("GetSnapshotTree: Failed after %v: %v", duration, err)
 		return nil, err
 	}
-	log.Printf("GetSnapshotTree: Completed in %v, output size: %d bytes", duration, len(output))
+	logger.Info("GetSnapshotTree: Completed in %v, output size: %d bytes", duration, len(output))
 
 	var nodes []ResticNode
 	current := []byte(output)
@@ -369,6 +403,12 @@ func GetSnapshotTree(repoName, snapshotID string) ([]ResticNode, error) {
 		}
 	}
 
+	logger.Info("GetSnapshotTree: Parsed %d nodes", len(nodes))
+
+	treeCacheMutex.Lock()
+	treeCache[cacheKey] = nodes
+	treeCacheMutex.Unlock()
+
 	return nodes, nil
 }
 
@@ -380,7 +420,7 @@ type RestoreRequest struct {
 }
 
 func RestoreSnapshot(req RestoreRequest, repoName string) error {
-	log.Printf("RestoreSnapshot: request for repo %s, snap %s", repoName, req.SnapshotID)
+	logger.Info("RestoreSnapshot: Request for repo %s, snap %s", repoName, req.SnapshotID)
 
 	repoPath := filepath.Join(".", "repos", repoName)
 	password := os.Getenv("RESTIC_PASSWORD")
@@ -404,7 +444,7 @@ func RestoreSnapshot(req RestoreRequest, repoName string) error {
 
 	// Auto-Cleanup: Remove the ENTIRE ./restore root CONTENTS to ensure only the latest restore exists
 	// User requested NOT to delete the root folder itself, just contents.
-	log.Printf("RestoreSnapshot: Wiping contents of restore root %s", absRestoreRoot)
+	logger.Info("RestoreSnapshot: Wiping contents of restore root %s", absRestoreRoot)
 
 	dirEntries, err := os.ReadDir(absRestoreRoot)
 	if err != nil && !os.IsNotExist(err) {
@@ -436,14 +476,14 @@ func RestoreSnapshot(req RestoreRequest, repoName string) error {
 	cmd := exec.Command("restic", args...)
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
-	log.Printf("RestoreSnapshot: Running %v", cmd.Args)
+	logger.Info("RestoreSnapshot: Running %v", cmd.Args)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("RestoreSnapshot: Error: %v, Output: %s", err, string(output))
+		logger.Error("RestoreSnapshot: Error: %v, Output: %s", err, string(output))
 		return fmt.Errorf("restore failed: %s", string(output)) // Return output as error message
 	}
 
-	log.Printf("RestoreSnapshot: Success")
+	logger.Info("RestoreSnapshot: Success")
 	return nil
 }
 
@@ -508,13 +548,14 @@ func GetCheckStatus() CheckStatus {
 }
 
 func runCheckProcess(repoName string) {
+	logger.Info("StartCheck: Starting integrity check for repo %s", repoName)
 	repoPath := filepath.Join(".", "repos", repoName)
 	password := os.Getenv("RESTIC_PASSWORD")
 	if password == "" {
 		password = "test"
 	}
 
-	cmd := exec.Command("restic", "-r", repoPath, "check", "--no-lock")
+	cmd := exec.Command("restic", "-r", repoPath, "check")
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 
 	// Capture stdout and stderr
@@ -522,6 +563,7 @@ func runCheckProcess(repoName string) {
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
+		logger.Error("StartCheck: Failed to start process: %v", err)
 		currentCheckTask.Lock()
 		currentCheckTask.Running = false
 		currentCheckTask.Done = true
@@ -543,6 +585,8 @@ func runCheckProcess(repoName string) {
 				for _, line := range lines {
 					if line != "" {
 						currentCheckTask.Logs = append(currentCheckTask.Logs, line)
+						// Optional: Log every line to DB? Might be noisy.
+						// logger.Debug("Check: %s", line)
 					}
 				}
 				currentCheckTask.Unlock()
@@ -566,11 +610,113 @@ func runCheckProcess(repoName string) {
 	currentCheckTask.Done = true
 	if err != nil {
 		currentCheckTask.Error = err.Error()
+		logger.Error("StartCheck: Integrity check failed: %v", err)
 		currentCheckTask.Logs = append(currentCheckTask.Logs, fmt.Sprintf("Check failed: %v", err))
 	} else {
+		logger.Info("StartCheck: Integrity check completed successfully")
 		currentCheckTask.Logs = append(currentCheckTask.Logs, "Check completed successfully.")
 	}
 	currentCheckTask.Unlock()
+}
+
+// --- Background Stats Worker ---
+
+func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
+	styleMutex.Lock()
+	if statsProgress.Running {
+		styleMutex.Unlock()
+		return // Already running
+	}
+	statsProgress = StatsProgress{
+		Total:     len(snapshots),
+		Processed: 0,
+		Running:   true,
+	}
+	styleMutex.Unlock()
+
+	go func() {
+		logger.Info("StatsWorker: Starting background stats enrichment for %d snapshots in %s", len(snapshots), repoName)
+
+		for _, s := range snapshots {
+			styleMutex.Lock()
+			statsProgress.CurrentID = s.ShortID
+			styleMutex.Unlock()
+
+			// Check DB Cache
+			var cachedSize int64
+			var cachedCount int
+			var cachedProcessed bool
+			if DB != nil {
+				err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&cachedSize, &cachedCount, &cachedProcessed)
+				if err == nil && cachedProcessed {
+					// Already have stats, skip
+					styleMutex.Lock()
+					statsProgress.Processed++
+					styleMutex.Unlock()
+					continue
+				}
+			}
+
+			// Run Restic Stats
+			repoPath := filepath.Join(".", "repos", repoName)
+			password := os.Getenv("RESTIC_PASSWORD")
+			if password == "" {
+				password = "test"
+			}
+
+			// 1. Stats
+			cmd := exec.Command("restic", "-r", repoPath, "stats", s.ID, "--mode", "restore-size", "--json")
+			cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+			out, err := cmd.Output()
+
+			size := int64(0)
+			count := 0
+
+			if err == nil {
+				var res struct {
+					TotalSize      int64 `json:"total_size"`
+					TotalFileCount int   `json:"total_file_count"`
+				}
+				if json.Unmarshal(out, &res) == nil {
+					size = res.TotalSize
+					count = res.TotalFileCount
+				}
+			} else {
+				// Log error?
+				styleMutex.Lock()
+				statsProgress.ErrorCount++
+				styleMutex.Unlock()
+			}
+
+			// 2. Duration (from 'cat snapshot')
+			// duration := "unknown"
+
+			// Update Progress
+			styleMutex.Lock()
+			statsProgress.Processed++
+			styleMutex.Unlock()
+
+			// Save to DB
+			if DB != nil {
+				_, err := DB.Exec(`
+					INSERT INTO snapshot_cache (snapshot_id, repo_name, size, file_count, processed)
+					VALUES (?, ?, ?, ?, ?)
+					ON DUPLICATE KEY UPDATE size=?, file_count=?, processed=?, updated_at=CURRENT_TIMESTAMP
+				`, s.ID, repoName, size, count, true, size, count, true)
+				if err != nil {
+					logger.Error("StatsWorker: Failed to save cache for %s: %v", s.ShortID, err)
+				} else {
+					logger.Info("StatsWorker: Processed %s -> Size: %s, Files: %d", s.ShortID, formatBytes(size), count)
+				}
+			}
+		}
+
+		styleMutex.Lock()
+		statsProgress.Running = false
+		statsProgress.CurrentID = ""
+		styleMutex.Unlock()
+		logger.Info("StatsWorker: Finished enrichment")
+	}()
 }
 
 func formatBytes(b int64) string {

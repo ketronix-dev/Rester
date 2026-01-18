@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"rester/auth"
 	"rester/checker"
+	"rester/logger"
 	"rester/ui"
 
 	"github.com/maxence-charriere/go-app/v9/pkg/app"
@@ -28,6 +29,11 @@ func main() {
 		log.Fatalf("Failed to init DB: %v", err)
 	}
 
+	// Initialize Logger
+	logger.Init(auth.DB)
+	checker.SetDB(auth.DB)
+	logger.Info("System startup initiating...")
+
 	// Configure the go-app handler
 	handler := &app.Handler{
 		Name:        "Rester",
@@ -49,6 +55,7 @@ func main() {
 	app.Route("/", &ui.Home{})
 	app.Route("/login", &ui.LoginPage{})
 	app.Route("/register", &ui.RegisterPage{})
+	app.Route("/logs", &ui.LogsPage{})
 
 	http.Handle("/", handler)
 
@@ -61,6 +68,18 @@ func main() {
 
 	// Protected Endpoints
 	http.HandleFunc("/api/status", auth.Protect(statusHandler))
+
+	http.HandleFunc("/api/logs", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
+		limit := 100
+		logs, err := logger.GetLogs(limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(logs)
+	}))
+
 	http.HandleFunc("/api/repo", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
 		if name == "" {
@@ -69,12 +88,18 @@ func main() {
 		}
 		stats, err := checker.GetRepoStats(name)
 		if err != nil {
-			log.Printf("Error getting repo stats: %v", err)
+			logger.Error("Error getting repo stats: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
+	}))
+
+	http.HandleFunc("/api/repo/stats-progress", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
+		progress := checker.GetStatsProgress()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(progress)
 	}))
 
 	http.HandleFunc("/api/snapshot", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +111,7 @@ func main() {
 		}
 		nodes, err := checker.GetSnapshotTree(repo, id)
 		if err != nil {
-			log.Printf("Error getting snapshot tree: %v", err)
+			logger.Error("Error getting snapshot tree: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -105,11 +130,14 @@ func main() {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
+
+		logger.Info("Starting restore for snapshot %s", req.SnapshotID)
 		if err := checker.RestoreSnapshot(req, repo); err != nil {
-			log.Printf("Error restoring snapshot: %v", err)
+			logger.Error("Error restoring snapshot: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		logger.Info("Restore completed successfully for %s", req.SnapshotID)
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -120,7 +148,9 @@ func main() {
 			http.Error(w, "Missing repo parameter", http.StatusBadRequest)
 			return
 		}
+		logger.Info("Starting integrity check for repo %s", repo)
 		if err := checker.StartCheck(repo); err != nil {
+			logger.Warn("Failed to start check: %v", err)
 			http.Error(w, err.Error(), http.StatusConflict) // 409 if already running
 			return
 		}
@@ -133,7 +163,7 @@ func main() {
 		json.NewEncoder(w).Encode(status)
 	}))
 
-	log.Println("Starting Rester on :8000...")
+	logger.Info("Starting Rester on :8000...")
 	if err := http.ListenAndServe(":8000", nil); err != nil {
 		log.Fatal(err)
 	}

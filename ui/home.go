@@ -40,9 +40,20 @@ type Home struct {
 	SelectionIncludes map[string]bool
 	SelectionExcludes map[string]bool
 
+	// Stats Progress
+	StatsProgress StatsProgress
+
 	// Check State
 	CheckModalOpen bool
 	CheckStatus    checker.CheckStatus
+}
+
+type StatsProgress struct {
+	Total      int    `json:"total"`
+	Processed  int    `json:"processed"`
+	ErrorCount int    `json:"error_count"`
+	Running    bool   `json:"running"`
+	CurrentID  string `json:"current_id"`
 }
 
 type Snapshot struct {
@@ -103,6 +114,15 @@ func (h *Home) OnMount(ctx app.Context) {
 				if h.CheckModalOpen {
 					ctx.Dispatch(func(ctx app.Context) {
 						h.updateCheckStatus(ctx)
+					})
+				}
+
+				// Stats Progress Polling
+				// Always poll if there is a repo selected, or smartly poll if we know it's running.
+				// For now: Poll every 2s if RepeStats.SnapshotCount > 0
+				if h.CurrentRepo != "" {
+					ctx.Dispatch(func(ctx app.Context) {
+						h.updateStatsProgress(ctx)
 					})
 				}
 
@@ -276,6 +296,29 @@ func (h *Home) updateStatus(ctx app.Context) {
 		ctx.Dispatch(func(ctx app.Context) {
 			h.Status = status
 			h.Loading = false
+			h.Update()
+		})
+	}()
+}
+
+func (h *Home) updateStatsProgress(ctx app.Context) {
+	go func() {
+		resp, err := http.Get("/api/repo/stats-progress")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		var progress StatsProgress
+		if err := json.NewDecoder(resp.Body).Decode(&progress); err != nil {
+			return
+		}
+
+		h.savedContext.Dispatch(func(ctx app.Context) {
+			h.StatsProgress = progress
+			// If we just finished (Running became false), refresh stats once to get new numbers
+			// But careful with loops.
+			// Let's just update UI.
 			h.Update()
 		})
 	}()
@@ -1094,7 +1137,6 @@ func (h *Home) Render() app.UI {
 							),
 						app.Div().Body(
 							app.H1().Class("page-title").Text("Backups "+h.CurrentRepo),
-							app.Span().Class("page-subtitle").Text("Location: /home/artem/Downloads/repos/"+h.CurrentRepo),
 						),
 					),
 				),
@@ -1143,6 +1185,20 @@ func (h *Home) Render() app.UI {
 								Body(
 									app.Span().Class("material-symbols-rounded").Style("font-size", "20px").Text("refresh"),
 								),
+						),
+					),
+					// Progress Bar
+					app.If(h.StatsProgress.Running,
+						app.Div().Class("stats-progress").Style("margin", "0 16px 16px 16px").Body(
+							app.Div().Style("display", "flex").Style("justify-content", "space-between").Style("margin-bottom", "4px").Body(
+								app.Span().Style("font-size", "12px").Text(fmt.Sprintf("Processing stats: %d/%d snapshots...", h.StatsProgress.Processed, h.StatsProgress.Total)),
+								app.Span().Style("font-size", "12px").Text(fmt.Sprintf("%s", h.StatsProgress.CurrentID)),
+							),
+							app.Progress().
+								Max(h.StatsProgress.Total).
+								Value(h.StatsProgress.Processed).
+								Style("width", "100%").
+								Style("height", "4px"),
 						),
 					),
 					app.Div().Class("snapshot-list").Body(

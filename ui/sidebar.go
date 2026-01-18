@@ -101,6 +101,13 @@ func (s *Sidebar) Render() app.UI {
 					app.Span().Text(resticText),
 				),
 			),
+			// Logs
+			app.Div().Class("sys-stat").Style("cursor", "pointer").OnClick(func(ctx app.Context, e app.Event) { ctx.Navigate("/logs") }).Body(
+				app.Div().Class("sys-stat-label").Body(
+					app.Span().Class("material-symbols-rounded").Text("receipt_long"),
+					app.Text("System Logs"),
+				),
+			),
 			// Logout
 			app.Div().Class("sys-stat").Style("cursor", "pointer").OnClick(func(ctx app.Context, e app.Event) {
 				if s.OnLogout != nil {

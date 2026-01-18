@@ -10,6 +10,7 @@ func main() {
 	app.Route("/", &ui.Home{})
 	app.Route("/login", &ui.LoginPage{})
 	app.Route("/register", &ui.RegisterPage{})
+	app.Route("/logs", &ui.LogsPage{})
 
 	app.RunWhenOnBrowser()
 }
