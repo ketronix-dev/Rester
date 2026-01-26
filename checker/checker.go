@@ -694,13 +694,16 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot, repoPath, passw
 			var cachedProcessed bool
 			if DB != nil {
 				err := DB.QueryRow("SELECT size, file_count, duration, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&cachedSize, &cachedCount, &cachedDuration, &cachedProcessed)
-				if err == nil && cachedProcessed && cachedDuration.Valid && cachedDuration.String != "" {
-					// Already fully processed (including duration), skip
+				// Only skip if we have REAL duration (not "-" placeholder)
+				if err == nil && cachedProcessed && cachedDuration.Valid && cachedDuration.String != "" && cachedDuration.String != "-" {
+					// Already fully processed with valid duration, skip
+					logger.Debug("StatsWorker: Skipping %s (cached: size=%d, duration=%s)", s.ShortID, cachedSize, cachedDuration.String)
 					styleMutex.Lock()
 					statsProgress.Processed++
 					styleMutex.Unlock()
 					continue
 				}
+				logger.Info("StatsWorker: Processing %s (cached: processed=%v, duration=%v)", s.ShortID, cachedProcessed, cachedDuration)
 			}
 
 			size := cachedSize
@@ -766,12 +769,16 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot, repoPath, passw
 
 // getSnapshotDuration extracts backup duration from restic cat snapshot output
 func getSnapshotDuration(repoPath, snapshotID, password string) string {
+	logger.Info("getSnapshotDuration: Running 'restic cat snapshot %s'", snapshotID)
 	cmd := exec.Command("restic", "-r", repoPath, "cat", "snapshot", snapshotID)
 	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
 	out, err := cmd.Output()
 	if err != nil {
+		logger.Error("getSnapshotDuration: Command failed for %s: %v", snapshotID, err)
 		return "-"
 	}
+
+	logger.Debug("getSnapshotDuration: Raw output length: %d bytes", len(out))
 
 	var snapData struct {
 		Summary struct {
@@ -781,15 +788,21 @@ func getSnapshotDuration(repoPath, snapshotID, password string) string {
 	}
 
 	if err := json.Unmarshal(out, &snapData); err != nil {
+		logger.Error("getSnapshotDuration: JSON unmarshal failed for %s: %v", snapshotID, err)
 		return "-"
 	}
 
+	logger.Info("getSnapshotDuration: Parsed - BackupStart=%v, BackupEnd=%v", snapData.Summary.BackupStart, snapData.Summary.BackupEnd)
+
 	if snapData.Summary.BackupStart.IsZero() || snapData.Summary.BackupEnd.IsZero() {
+		logger.Warn("getSnapshotDuration: No summary data found for %s (old restic version?)", snapshotID)
 		return "-"
 	}
 
 	dur := snapData.Summary.BackupEnd.Sub(snapData.Summary.BackupStart)
-	return dur.Round(time.Second).String()
+	result := dur.Round(time.Second).String()
+	logger.Info("getSnapshotDuration: Success! Duration for %s = %s", snapshotID, result)
+	return result
 }
 
 func formatBytes(b int64) string {
