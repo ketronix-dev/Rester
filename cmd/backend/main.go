@@ -181,6 +181,22 @@ func main() {
 		w.Write(rawJSON)
 	}))
 
+	// Debug endpoint to see raw 'restic snapshots --json' output
+	http.HandleFunc("/api/debug/snapshots-raw", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
+		repo := r.URL.Query().Get("repo")
+		if repo == "" {
+			http.Error(w, "Missing repo parameter", http.StatusBadRequest)
+			return
+		}
+		rawJSON, err := checker.GetSnapshotsRawJSON(repo)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(rawJSON)
+	}))
+
 	logger.Info("Starting Rester on :8000...")
 	if err := http.ListenAndServe(":8000", nil); err != nil {
 		log.Fatal(err)

@@ -818,6 +818,19 @@ func GetSnapshotRawJSON(repoName, snapshotID string) ([]byte, error) {
 	return cmd.Output()
 }
 
+// GetSnapshotsRawJSON returns raw JSON from restic snapshots --json for debugging
+func GetSnapshotsRawJSON(repoName string) ([]byte, error) {
+	repoPath := filepath.Join(".", "repos", repoName)
+	password := os.Getenv("RESTIC_PASSWORD")
+	if password == "" {
+		password = "test"
+	}
+
+	cmd := exec.Command("restic", "-r", repoPath, "snapshots", "--json")
+	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+	return cmd.Output()
+}
+
 func formatBytes(b int64) string {
 	const unit = 1024
 	if b < unit {

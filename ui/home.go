@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"rester/checker"
 	"strings"
@@ -390,6 +391,18 @@ func (h *Home) selectRepo(ctx app.Context, repo string) {
 	h.RepoLoading = true
 	h.Update()
 	h.updateRepoStats(ctx, repo)
+
+	// Debug: Fetch and log raw snapshots JSON to browser console
+	go func() {
+		resp, err := http.Get("/api/debug/snapshots-raw?repo=" + repo)
+		if err != nil {
+			app.Log("[DEBUG] Failed to fetch raw snapshots:", err)
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		app.Logf("[DEBUG RAW SNAPSHOTS JSON for %s]:\n%s", repo, string(body))
+	}()
 }
 
 func (h *Home) loadTree(ctx app.Context, id string) {
