@@ -307,21 +307,23 @@ func GetRepoStats(name string) (RepoStats, error) {
 		totalSize += uint64(s.Size)
 		totalFiles += uint64(s.FileCount)
 	}
-	// Note: Without 'restic stats', UncompressedUsage and CompressionRatio are approximations or need separate logic.
-	// For now we rely on the expensive 'restic stats' command which we run NEXT.
 
 	// 2. Set snapshot count from list (fast)
 	stats.SnapshotCount = len(stats.Snapshots)
+	logger.Info("GetRepoStats: Parsed %d snapshots for '%s'", stats.SnapshotCount, name)
 
-	// 3. Try to get repo stats from cache first
+	// 3. Try to get repo stats from existing cache (if background worker already updated them)
 	cacheMutex.Lock()
 	if cached, ok := repoCache[name]; ok {
-		// Use cached disk usage stats if available
-		stats.DiskUsage = cached.Stats.DiskUsage
-		stats.UncompressedUsage = cached.Stats.UncompressedUsage
-		stats.CompressionRatio = cached.Stats.CompressionRatio
-		stats.SpaceSaving = cached.Stats.SpaceSaving
-		stats.BlobCount = cached.Stats.BlobCount
+		// Use cached disk usage stats if they are real values (not placeholders)
+		if cached.Stats.DiskUsage != "" && cached.Stats.DiskUsage != "Calculating..." {
+			stats.DiskUsage = cached.Stats.DiskUsage
+			stats.UncompressedUsage = cached.Stats.UncompressedUsage
+			stats.CompressionRatio = cached.Stats.CompressionRatio
+			stats.SpaceSaving = cached.Stats.SpaceSaving
+			stats.BlobCount = cached.Stats.BlobCount
+			logger.Info("GetRepoStats: Using cached disk stats - Usage: %s, Ratio: %s", stats.DiskUsage, stats.CompressionRatio)
+		}
 	}
 	cacheMutex.Unlock()
 
@@ -331,12 +333,16 @@ func GetRepoStats(name string) (RepoStats, error) {
 		stats.UncompressedUsage = "Calculating..."
 		stats.CompressionRatio = "-"
 		stats.SpaceSaving = "-"
+		logger.Info("GetRepoStats: No cached disk stats, will calculate in background")
 	}
 
-	// Cache the snapshot list immediately (with whatever stats we have)
+	// Cache the snapshot list (preserving existing disk stats if available)
 	cacheMutex.Lock()
 	repoCache[name] = CachedRepoStats{Stats: stats, Timestamp: time.Now()}
 	cacheMutex.Unlock()
+
+	logger.Info("GetRepoStats: Returning stats - DiskUsage: %s, Snapshots: %d, Ratio: %s, Blobs: %d",
+		stats.DiskUsage, stats.SnapshotCount, stats.CompressionRatio, stats.BlobCount)
 
 	// Trigger background processing for both snapshot details AND repo stats
 	ProcessSnapshotStats(name, stats.Snapshots, repoPath, password)

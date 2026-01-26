@@ -303,23 +303,38 @@ func (h *Home) updateStatus(ctx app.Context) {
 }
 
 func (h *Home) updateStatsProgress(ctx app.Context) {
+	// Track if we were previously running to detect completion
+	wasRunning := h.StatsProgress.Running
+
 	go func() {
 		resp, err := http.Get("/api/repo/stats-progress")
 		if err != nil {
+			app.Log("updateStatsProgress: Failed to fetch progress:", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		var progress StatsProgress
 		if err := json.NewDecoder(resp.Body).Decode(&progress); err != nil {
+			app.Log("updateStatsProgress: Failed to decode progress:", err)
 			return
 		}
 
 		h.savedContext.Dispatch(func(ctx app.Context) {
+			oldProgress := h.StatsProgress
 			h.StatsProgress = progress
-			// If we just finished (Running became false), refresh stats once to get new numbers
-			// But careful with loops.
-			// Let's just update UI.
+
+			// Log progress to browser console
+			if progress.Running {
+				app.Logf("[StatsProgress] Running: %d/%d, Current: %s", progress.Processed, progress.Total, progress.CurrentID)
+			}
+
+			// If background processing just completed, refresh repo stats to get updated data
+			if (wasRunning || oldProgress.Running) && !progress.Running && h.CurrentRepo != "" {
+				app.Logf("[StatsProgress] Background processing completed! Refreshing repo stats for: %s", h.CurrentRepo)
+				h.updateRepoStats(ctx, h.CurrentRepo)
+			}
+
 			h.Update()
 		})
 	}()
@@ -328,27 +343,36 @@ func (h *Home) updateStatsProgress(ctx app.Context) {
 func (h *Home) updateRepoStats(ctx app.Context, repo string) {
 	// Capture current version to detect if user switched repos during request
 	requestVersion := h.RepoStatsVersion
+	app.Logf("[updateRepoStats] Starting fetch for repo: %s (version: %d)", repo, requestVersion)
 
 	go func() {
 		resp, err := http.Get("/api/repo?name=" + repo)
 		if err != nil {
-			app.Log("Failed to fetch repo stats:", err)
+			app.Log("[updateRepoStats] Failed to fetch repo stats:", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		var stats checker.RepoStats
 		if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-			app.Log("Failed to decode repo stats:", err)
+			app.Log("[updateRepoStats] Failed to decode repo stats:", err)
 			return
+		}
+
+		app.Logf("[updateRepoStats] Received: DiskUsage=%s, Snapshots=%d, Compression=%s, Blobs=%d",
+			stats.DiskUsage, len(stats.Snapshots), stats.CompressionRatio, stats.BlobCount)
+		if len(stats.Snapshots) > 0 {
+			app.Logf("[updateRepoStats] First snapshot: ID=%s, Duration=%s, Size=%d",
+				stats.Snapshots[0].ShortID, stats.Snapshots[0].Duration, stats.Snapshots[0].Size)
 		}
 
 		ctx.Dispatch(func(ctx app.Context) {
 			// Only apply if this response is for the current repo selection
 			if h.RepoStatsVersion != requestVersion || h.CurrentRepo != repo {
-				app.Log("Discarding stale repo stats response for:", repo)
+				app.Logf("[updateRepoStats] Discarding stale response for: %s (current version: %d)", repo, h.RepoStatsVersion)
 				return
 			}
+			app.Logf("[updateRepoStats] Applying stats for: %s", repo)
 			h.RepoStats = stats
 			h.RepoLoading = false
 			h.Update()
