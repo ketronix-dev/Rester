@@ -14,24 +14,25 @@ import (
 
 type Home struct {
 	app.Compo
-	Status          checker.SystemStatus
-	RepoStats       checker.RepoStats
-	Loading         bool
-	RepoLoading     bool
-	CurrentRepo     string
-	ModalSnapshotID string                // For modal display (key in TreeData)
-	ModalShortID    string                // For header display
-	ActiveMenuID    string                // For action menu tracking
-	TreeData        map[string][]TreeNode // Cache for tree data
-	TreeLoading     map[string]bool       // Loading state per snap
-	ticker          *time.Ticker
-	stopTick        chan bool
-	savedContext    app.Context     // Persistent context from OnMount
-	TreeSearchQuery string          // Search filter for tree
-	TreeExpanded    map[string]bool // Expanded directory paths (if path is here, its children are shown)
-	TreePage        int             // Current page for tree pagination
-	Theme           string          // light or dark
-	SidebarOpen     bool            // Mobile sidebar state
+	Status           checker.SystemStatus
+	RepoStats        checker.RepoStats
+	Loading          bool
+	RepoLoading      bool
+	CurrentRepo      string
+	RepoStatsVersion int                   // Version counter for race condition prevention
+	ModalSnapshotID  string                // For modal display (key in TreeData)
+	ModalShortID     string                // For header display
+	ActiveMenuID     string                // For action menu tracking
+	TreeData         map[string][]TreeNode // Cache for tree data
+	TreeLoading      map[string]bool       // Loading state per snap
+	ticker           *time.Ticker
+	stopTick         chan bool
+	savedContext     app.Context     // Persistent context from OnMount
+	TreeSearchQuery  string          // Search filter for tree
+	TreeExpanded     map[string]bool // Expanded directory paths (if path is here, its children are shown)
+	TreePage         int             // Current page for tree pagination
+	Theme            string          // light or dark
+	SidebarOpen      bool            // Mobile sidebar state
 
 	// Restore State
 	RestoreModalOpen  bool
@@ -325,6 +326,9 @@ func (h *Home) updateStatsProgress(ctx app.Context) {
 }
 
 func (h *Home) updateRepoStats(ctx app.Context, repo string) {
+	// Capture current version to detect if user switched repos during request
+	requestVersion := h.RepoStatsVersion
+
 	go func() {
 		resp, err := http.Get("/api/repo?name=" + repo)
 		if err != nil {
@@ -340,6 +344,11 @@ func (h *Home) updateRepoStats(ctx app.Context, repo string) {
 		}
 
 		ctx.Dispatch(func(ctx app.Context) {
+			// Only apply if this response is for the current repo selection
+			if h.RepoStatsVersion != requestVersion || h.CurrentRepo != repo {
+				app.Log("Discarding stale repo stats response for:", repo)
+				return
+			}
 			h.RepoStats = stats
 			h.RepoLoading = false
 			h.Update()
@@ -351,6 +360,7 @@ func (h *Home) selectRepo(ctx app.Context, repo string) {
 	if h.CurrentRepo == repo {
 		return
 	}
+	h.RepoStatsVersion++ // Increment version to invalidate any in-flight requests
 	h.CurrentRepo = repo
 	h.RepoStats = checker.RepoStats{}
 	h.RepoLoading = true

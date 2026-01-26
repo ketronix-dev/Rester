@@ -219,10 +219,14 @@ func GetRepoStats(name string) (RepoStats, error) {
 				for i, s := range enrichedSnaps {
 					var dbSize int64
 					var dbCount int
+					var dbDuration sql.NullString
 					var dbProcessed bool
-					if err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbProcessed); err == nil && dbProcessed {
+					if err := DB.QueryRow("SELECT size, file_count, duration, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbDuration, &dbProcessed); err == nil && dbProcessed {
 						enrichedSnaps[i].Size = dbSize
 						enrichedSnaps[i].FileCount = dbCount
+						if dbDuration.Valid && dbDuration.String != "" {
+							enrichedSnaps[i].Duration = dbDuration.String
+						}
 					}
 				}
 				cached.Stats.Snapshots = enrichedSnaps
@@ -264,38 +268,33 @@ func GetRepoStats(name string) (RepoStats, error) {
 
 	stats.Snapshots = make([]Snapshot, 0, len(resticSnaps))
 	for _, rs := range resticSnaps {
-		durStr := "-"
-		if !rs.Summary.BackupStart.IsZero() && !rs.Summary.BackupEnd.IsZero() {
-			dur := rs.Summary.BackupEnd.Sub(rs.Summary.BackupStart)
-			durStr = dur.Round(time.Second).String()
-		}
-
 		s := Snapshot{
 			ID:        rs.ID,
 			ShortID:   rs.ShortID,
 			Time:      rs.Time,
 			TimeStr:   rs.Time.Format("02.01.2006 15:04"),
-			Size:      rs.Summary.TotalBytesProcessed,
-			FileCount: rs.Summary.TotalFilesProcessed,
+			Size:      0,
+			FileCount: 0,
 			Tree:      rs.Tree,
 			Paths:     rs.Paths,
 			Hostname:  rs.Hostname,
 			Username:  rs.Username,
 			Tags:      rs.Tags,
-			Duration:  durStr,
+			Duration:  "-", // Will be populated from DB or background worker
 		}
 
-		// Enrich from DB
+		// Enrich from DB cache (size, file count, and duration)
 		if DB != nil {
 			var dbSize int64
 			var dbCount int
+			var dbDuration sql.NullString
 			var dbProcessed bool
-			if err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbProcessed); err == nil && dbProcessed {
+			if err := DB.QueryRow("SELECT size, file_count, duration, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&dbSize, &dbCount, &dbDuration, &dbProcessed); err == nil && dbProcessed {
 				s.Size = dbSize
 				s.FileCount = dbCount
-				// Duration is tricky as we just have string from 'cat snapshot' or stored val.
-				// Plan had 'duration' col. If we implement duration in worker, we can read it too.
-				// For now mainly Size/Count.
+				if dbDuration.Valid && dbDuration.String != "" {
+					s.Duration = dbDuration.String
+				}
 			}
 		}
 
@@ -311,44 +310,36 @@ func GetRepoStats(name string) (RepoStats, error) {
 	// Note: Without 'restic stats', UncompressedUsage and CompressionRatio are approximations or need separate logic.
 	// For now we rely on the expensive 'restic stats' command which we run NEXT.
 
-	// 2. Run Stats (Expensive!)
-	logger.Info("GetRepoStats: Running stats command...")
-	// For performance, we might want to skip this if not explicitly requested, or cache it heavily.
-	// Current implementation runs it always, which is the bottleneck.
-	// Optimizing to parse summary from snapshots or standard `restic stats`
+	// 2. Set snapshot count from list (fast)
+	stats.SnapshotCount = len(stats.Snapshots)
 
-	cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--mode", "raw-data", "--json")
-	cmdStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
-	outputStats, err := cmdStats.Output()
-	if err == nil {
-		var rStats ResticStats
-		if err := json.Unmarshal(outputStats, &rStats); err == nil {
-			stats.DiskUsage = formatBytes(rStats.TotalSize)
-			stats.UncompressedUsage = formatBytes(rStats.TotalUncompressedSize)
-			if rStats.TotalSize > 0 {
-				ratio := float64(rStats.TotalUncompressedSize) / float64(rStats.TotalSize)
-				stats.CompressionRatio = fmt.Sprintf("%.2fx", ratio)
+	// 3. Try to get repo stats from cache first
+	cacheMutex.Lock()
+	if cached, ok := repoCache[name]; ok {
+		// Use cached disk usage stats if available
+		stats.DiskUsage = cached.Stats.DiskUsage
+		stats.UncompressedUsage = cached.Stats.UncompressedUsage
+		stats.CompressionRatio = cached.Stats.CompressionRatio
+		stats.SpaceSaving = cached.Stats.SpaceSaving
+		stats.BlobCount = cached.Stats.BlobCount
+	}
+	cacheMutex.Unlock()
 
-				// User requested percentage for savings
-				savingPct := (float64(rStats.TotalUncompressedSize-rStats.TotalSize) / float64(rStats.TotalUncompressedSize)) * 100
-				stats.SpaceSaving = fmt.Sprintf("%.1f%%", savingPct)
-			}
-			stats.SnapshotCount = rStats.SnapshotsCount
-			stats.BlobCount = rStats.TotalBlobCount
-
-			logger.Info("GetRepoStats: Restic Stats - Size: %s, Uncompressed: %s, Ratio: %s", stats.DiskUsage, stats.UncompressedUsage, stats.CompressionRatio)
-		}
-	} else {
-		stats.DiskUsage = "0 B"
-		stats.UncompressedUsage = "0 B"
+	// If we don't have disk usage stats, set placeholder and fetch in background
+	if stats.DiskUsage == "" {
+		stats.DiskUsage = "Calculating..."
+		stats.UncompressedUsage = "Calculating..."
+		stats.CompressionRatio = "-"
+		stats.SpaceSaving = "-"
 	}
 
+	// Cache the snapshot list immediately (with whatever stats we have)
 	cacheMutex.Lock()
 	repoCache[name] = CachedRepoStats{Stats: stats, Timestamp: time.Now()}
 	cacheMutex.Unlock()
 
-	// Trigger background stats enrichment
-	ProcessSnapshotStats(name, stats.Snapshots)
+	// Trigger background processing for both snapshot details AND repo stats
+	ProcessSnapshotStats(name, stats.Snapshots, repoPath, password)
 
 	return stats, nil
 }
@@ -640,14 +631,14 @@ func runCheckProcess(repoName string) {
 
 // --- Background Stats Worker ---
 
-func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
+func ProcessSnapshotStats(repoName string, snapshots []Snapshot, repoPath, password string) {
 	styleMutex.Lock()
 	if statsProgress.Running {
 		styleMutex.Unlock()
 		return // Already running
 	}
 	statsProgress = StatsProgress{
-		Total:     len(snapshots),
+		Total:     len(snapshots) + 1, // +1 for repo stats
 		Processed: 0,
 		Running:   true,
 	}
@@ -656,6 +647,35 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
 	go func() {
 		logger.Info("StatsWorker: Starting background stats enrichment for %d snapshots in %s", len(snapshots), repoName)
 
+		// 1. First, fetch expensive repo stats in background
+		cmdStats := exec.Command("restic", "-r", repoPath, "stats", "--mode", "raw-data", "--json")
+		cmdStats.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+		outputStats, err := cmdStats.Output()
+		if err == nil {
+			var rStats ResticStats
+			if json.Unmarshal(outputStats, &rStats) == nil {
+				cacheMutex.Lock()
+				if cached, ok := repoCache[repoName]; ok {
+					cached.Stats.DiskUsage = formatBytes(rStats.TotalSize)
+					cached.Stats.UncompressedUsage = formatBytes(rStats.TotalUncompressedSize)
+					if rStats.TotalSize > 0 {
+						ratio := float64(rStats.TotalUncompressedSize) / float64(rStats.TotalSize)
+						cached.Stats.CompressionRatio = fmt.Sprintf("%.2fx", ratio)
+						savingPct := (float64(rStats.TotalUncompressedSize-rStats.TotalSize) / float64(rStats.TotalUncompressedSize)) * 100
+						cached.Stats.SpaceSaving = fmt.Sprintf("%.1f%%", savingPct)
+					}
+					cached.Stats.BlobCount = rStats.TotalBlobCount
+					repoCache[repoName] = cached
+					logger.Info("StatsWorker: Repo stats updated - Size: %s, Ratio: %s", cached.Stats.DiskUsage, cached.Stats.CompressionRatio)
+				}
+				cacheMutex.Unlock()
+			}
+		}
+		styleMutex.Lock()
+		statsProgress.Processed++
+		styleMutex.Unlock()
+
+		// 2. Process each snapshot
 		for _, s := range snapshots {
 			styleMutex.Lock()
 			statsProgress.CurrentID = s.ShortID
@@ -664,11 +684,12 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
 			// Check DB Cache
 			var cachedSize int64
 			var cachedCount int
+			var cachedDuration sql.NullString
 			var cachedProcessed bool
 			if DB != nil {
-				err := DB.QueryRow("SELECT size, file_count, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&cachedSize, &cachedCount, &cachedProcessed)
-				if err == nil && cachedProcessed {
-					// Already have stats, skip
+				err := DB.QueryRow("SELECT size, file_count, duration, processed FROM snapshot_cache WHERE snapshot_id = ?", s.ID).Scan(&cachedSize, &cachedCount, &cachedDuration, &cachedProcessed)
+				if err == nil && cachedProcessed && cachedDuration.Valid && cachedDuration.String != "" {
+					// Already fully processed (including duration), skip
 					styleMutex.Lock()
 					statsProgress.Processed++
 					styleMutex.Unlock()
@@ -676,39 +697,38 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
 				}
 			}
 
-			// Run Restic Stats
-			repoPath := filepath.Join(".", "repos", repoName)
-			password := os.Getenv("RESTIC_PASSWORD")
-			if password == "" {
-				password = "test"
+			size := cachedSize
+			count := cachedCount
+			duration := ""
+
+			// Get size/count if not already cached
+			if size == 0 {
+				cmd := exec.Command("restic", "-r", repoPath, "stats", s.ID, "--mode", "restore-size", "--json")
+				cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+				out, err := cmd.Output()
+
+				if err == nil {
+					var res struct {
+						TotalSize      int64 `json:"total_size"`
+						TotalFileCount int   `json:"total_file_count"`
+					}
+					if json.Unmarshal(out, &res) == nil {
+						size = res.TotalSize
+						count = res.TotalFileCount
+					}
+				} else {
+					styleMutex.Lock()
+					statsProgress.ErrorCount++
+					styleMutex.Unlock()
+				}
 			}
 
-			// 1. Stats
-			cmd := exec.Command("restic", "-r", repoPath, "stats", s.ID, "--mode", "restore-size", "--json")
-			cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
-			out, err := cmd.Output()
-
-			size := int64(0)
-			count := 0
-
-			if err == nil {
-				var res struct {
-					TotalSize      int64 `json:"total_size"`
-					TotalFileCount int   `json:"total_file_count"`
-				}
-				if json.Unmarshal(out, &res) == nil {
-					size = res.TotalSize
-					count = res.TotalFileCount
-				}
+			// Get duration via 'restic cat snapshot' (always fetch if not cached)
+			if !cachedDuration.Valid || cachedDuration.String == "" {
+				duration = getSnapshotDuration(repoPath, s.ID, password)
 			} else {
-				// Log error?
-				styleMutex.Lock()
-				statsProgress.ErrorCount++
-				styleMutex.Unlock()
+				duration = cachedDuration.String
 			}
-
-			// 2. Duration (from 'cat snapshot')
-			// duration := "unknown"
 
 			// Update Progress
 			styleMutex.Lock()
@@ -718,14 +738,14 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
 			// Save to DB
 			if DB != nil {
 				_, err := DB.Exec(`
-					INSERT INTO snapshot_cache (snapshot_id, repo_name, size, file_count, processed)
-					VALUES (?, ?, ?, ?, ?)
-					ON DUPLICATE KEY UPDATE size=?, file_count=?, processed=?, updated_at=CURRENT_TIMESTAMP
-				`, s.ID, repoName, size, count, true, size, count, true)
+					INSERT INTO snapshot_cache (snapshot_id, repo_name, size, file_count, duration, processed)
+					VALUES (?, ?, ?, ?, ?, ?)
+					ON DUPLICATE KEY UPDATE size=?, file_count=?, duration=?, processed=?, updated_at=CURRENT_TIMESTAMP
+				`, s.ID, repoName, size, count, duration, true, size, count, duration, true)
 				if err != nil {
 					logger.Error("StatsWorker: Failed to save cache for %s: %v", s.ShortID, err)
 				} else {
-					logger.Info("StatsWorker: Processed %s -> Size: %s, Files: %d", s.ShortID, formatBytes(size), count)
+					logger.Info("StatsWorker: Processed %s -> Size: %s, Files: %d, Duration: %s", s.ShortID, formatBytes(size), count, duration)
 				}
 			}
 		}
@@ -736,6 +756,34 @@ func ProcessSnapshotStats(repoName string, snapshots []Snapshot) {
 		styleMutex.Unlock()
 		logger.Info("StatsWorker: Finished enrichment")
 	}()
+}
+
+// getSnapshotDuration extracts backup duration from restic cat snapshot output
+func getSnapshotDuration(repoPath, snapshotID, password string) string {
+	cmd := exec.Command("restic", "-r", repoPath, "cat", "snapshot", snapshotID)
+	cmd.Env = append(os.Environ(), "RESTIC_PASSWORD="+password)
+	out, err := cmd.Output()
+	if err != nil {
+		return "-"
+	}
+
+	var snapData struct {
+		Summary struct {
+			BackupStart time.Time `json:"backup_start"`
+			BackupEnd   time.Time `json:"backup_end"`
+		} `json:"summary"`
+	}
+
+	if err := json.Unmarshal(out, &snapData); err != nil {
+		return "-"
+	}
+
+	if snapData.Summary.BackupStart.IsZero() || snapData.Summary.BackupEnd.IsZero() {
+		return "-"
+	}
+
+	dur := snapData.Summary.BackupEnd.Sub(snapData.Summary.BackupStart)
+	return dur.Round(time.Second).String()
 }
 
 func formatBytes(b int64) string {
