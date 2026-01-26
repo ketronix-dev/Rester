@@ -164,6 +164,23 @@ func main() {
 		json.NewEncoder(w).Encode(status)
 	}))
 
+	// Debug endpoint to see raw snapshot JSON
+	http.HandleFunc("/api/debug/snapshot-raw", auth.Protect(func(w http.ResponseWriter, r *http.Request) {
+		repo := r.URL.Query().Get("repo")
+		id := r.URL.Query().Get("id")
+		if repo == "" || id == "" {
+			http.Error(w, "Missing repo or id parameter", http.StatusBadRequest)
+			return
+		}
+		rawJSON, err := checker.GetSnapshotRawJSON(repo, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(rawJSON)
+	}))
+
 	logger.Info("Starting Rester on :8000...")
 	if err := http.ListenAndServe(":8000", nil); err != nil {
 		log.Fatal(err)
